@@ -1,6 +1,7 @@
 #include "tests/includes/test_framework.h"
 #include "tests/includes/test_utf8_path.h"
 #include "engine/local_modes/date_time_query.h"
+#include "engine/quanpin/fuzzy_pinyin.h"
 #include "engine/user_dictionary/user_dictionary_journal.h"
 
 #include <sqlite3.h>
@@ -671,6 +672,33 @@ TEST_CASE(UserDictionaryPromoteFuzzyCandidateNormalizesWeight)
         REQUIRE(!ranking_changed);
     }
     std::filesystem::remove_all(directory);
+}
+
+TEST_CASE(MergeFuzzyCandidatesDoesNotDropDatabaseCandidateForInferiorExactFallback)
+{
+    WordItem zhixin("zhi'xin", "之心", 174700, CandidateSource::Database, "zhi'xin");
+    WordItem zhixing_fallback("zhi'xin", "执行", 1, CandidateSource::Fallback, "zhi'xin");
+    zhixing_fallback.sentence_association = true;
+    std::vector<WordItem> exact = {zhixin, zhixing_fallback};
+
+    WordItem zhixing_db("zhi'xin", "执行", 549104, CandidateSource::Database, "zhi'xing");
+    zhixing_db.fuzzy = true;
+    WordItem zhixing_star("zhi'xin", "之星", 143780, CandidateSource::Database, "zhi'xing");
+    zhixing_star.fuzzy = true;
+    std::vector<WordItem> fuzzy = {zhixing_db, zhixing_star};
+
+    const auto merged = quanpin::merge_fuzzy_candidates(exact, fuzzy, [](const WordItem &item) {
+        return item.pinyin.size();
+    });
+
+    REQUIRE_EQ(merged.size(), 3);
+    REQUIRE_EQ(merged[0].word, "之心");
+    REQUIRE_EQ(merged[1].word, "执行");
+    REQUIRE_EQ(merged[1].source, CandidateSource::Database);
+    REQUIRE_EQ(merged[1].canonical_pinyin, "zhi'xing");
+    REQUIRE_EQ(merged[1].weight, 549104);
+    REQUIRE(merged[1].fuzzy);
+    REQUIRE_EQ(merged[2].word, "之星");
 }
 
 // 回归：调频必须能把另一种切分的词调到整个列表的首位。打 jian 时列表里混着 ji'an 的

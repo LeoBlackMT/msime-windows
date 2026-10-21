@@ -114,6 +114,27 @@ inline std::vector<Segments> fuzzy_segmentations(const Segments &segments, metas
 template <typename Group>
 std::vector<WordItem> merge_fuzzy_candidates(std::vector<WordItem> exact, std::vector<WordItem> fuzzy, Group group)
 {
+    // 精确列表里可能混有整句联想、词格解码或神经重排生成的整句行（Fallback/Generated/Neural/Collocation），
+    // 它们不是词库里真有的条目。如果模糊词库里真有该词（Database/UserDatabase），不能让低权重的生成句
+    // 抢占词形而把真实的模糊词库项去重掉（否则高频词会丢失真实词频、被甩到页尾且无法调频）。
+    // 将被生成句占用的词从 exact 中移出，让 fuzzy 中的词典项带着规范读音与真实权重参与混排。
+    std::unordered_set<std::string> fuzzy_db_words;
+    for (const auto &item : fuzzy)
+    {
+        if (item.source == CandidateSource::Database || item.source == CandidateSource::UserDatabase)
+            fuzzy_db_words.insert(item.word);
+    }
+    if (!fuzzy_db_words.empty())
+    {
+        exact.erase(std::remove_if(exact.begin(), exact.end(),
+                                   [&](const WordItem &item) {
+                                       const bool is_db = (item.source == CandidateSource::Database ||
+                                                           item.source == CandidateSource::UserDatabase);
+                                       return !is_db && fuzzy_db_words.find(item.word) != fuzzy_db_words.end();
+                                   }),
+                    exact.end());
+    }
+
     std::unordered_set<std::string> seen;
     for (const auto &item : exact)
         seen.insert(item.word);
