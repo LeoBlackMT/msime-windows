@@ -633,6 +633,38 @@ TEST_CASE(UserDictionaryPromoteBasesWeightOnTheHeaviestCandidateNotTheTopmost)
     std::filesystem::remove_all(directory);
 }
 
+TEST_CASE(UserDictionaryPromoteFuzzyCandidateNormalizesWeight)
+{
+    const auto directory =
+        std::filesystem::temp_directory_path() / ("msime-fuzzy-ranking-" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directories(directory);
+    const auto user_path = directory / "msime_user.db";
+    const auto main_path = directory / "msime.db";
+    {
+        TestDatabase db(main_path);
+        db.exec("CREATE TABLE tbl_2_z(key TEXT,jp TEXT,value TEXT,weight INTEGER);"
+                "INSERT INTO tbl_2_z VALUES("
+                "'zhi''xin','zx','知心',100000),"
+                "('zhi''xing','zx','执行',400000);");
+    }
+    WordItem zhixin("zhi'xin", "知心", 100000, CandidateSource::Database, "zhi'xin");
+    WordItem zhixing("zhi'xin", "执行", 400000, CandidateSource::Database, "zhi'xing");
+    zhixing.fuzzy = true;
+    std::vector<WordItem> candidates = {zhixin, zhixing};
+
+    bool ranking_changed = false;
+    REQUIRE(user_dictionary::adjust_candidate_ranking(test::Utf8(main_path), test::Utf8(user_path), "zhi'xin", candidates,
+                                                      "zhi'xing", "执行", "pin", 1, 1, true, &ranking_changed));
+    REQUIRE(ranking_changed);
+    {
+        TestDatabase db(main_path);
+        const std::int64_t new_w = db.scalar_int64("SELECT weight FROM tbl_2_z WHERE value='执行'");
+        REQUIRE(new_w > 500000);
+        REQUIRE(static_cast<double>(new_w) * 0.2 > 100000.0);
+    }
+    std::filesystem::remove_all(directory);
+}
+
 // 回归：调频必须能把另一种切分的词调到整个列表的首位。打 jian 时列表里混着 ji'an 的
 // 吉安（出货词库权重是 1，压在同组的积案 9420 底下），旧实现按音节数圈比较集，吉安
 // 只跟积案/几案比，可学权重封顶一万出头，怎么调都追不上 见 的 3460998——用户看到的就是

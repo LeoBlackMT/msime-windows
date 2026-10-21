@@ -22,6 +22,7 @@
 #include "../english/english_dictionary.h"
 #include "../local_modes/local_database.h"
 #include "../neural/json.h"
+#include "../quanpin/fuzzy_pinyin.h"
 #include "../quanpin/quanpin_utils.h"
 
 namespace user_dictionary
@@ -1533,8 +1534,20 @@ bool adjust_candidate_ranking(const std::string &main_db_path, const std::string
             continue;
         database_candidates.push_back(item);
     }
+    const auto effective_weight = [](const WordItem &item) -> std::int64_t {
+        if (!item.fuzzy)
+            return item.weight;
+        return static_cast<std::int64_t>(std::round(static_cast<double>(item.weight) * quanpin::kFuzzyWeightRatio));
+    };
+    const auto to_raw_weight = [](std::int64_t eff_weight, bool is_fuzzy) -> std::int64_t {
+        if (!is_fuzzy)
+            return eff_weight;
+        return static_cast<std::int64_t>(std::round(static_cast<double>(eff_weight) / quanpin::kFuzzyWeightRatio));
+    };
     std::stable_sort(database_candidates.begin(), database_candidates.end(),
-                     [](const WordItem &lhs, const WordItem &rhs) { return lhs.weight > rhs.weight; });
+                     [&](const WordItem &lhs, const WordItem &rhs) {
+                         return effective_weight(lhs) > effective_weight(rhs);
+                     });
     std::vector<bool> owns_entry_key;
     owns_entry_key.reserve(database_candidates.size());
     for (const auto &item : database_candidates)
@@ -1551,7 +1564,7 @@ bool adjust_candidate_ranking(const std::string &main_db_path, const std::string
         return false;
     }
     const size_t rank = static_cast<size_t>(selected - database_candidates.begin());
-    if (rank == 0)
+    if (rank == 0 && !ordered_candidates.empty() && ordered_candidates.front().word == value)
     {
         auto reset = prepare(
             user_db.get(), "DELETE FROM candidate_selection_state WHERE context_key=?1 AND entry_key=?2 AND value=?3");
@@ -1577,12 +1590,13 @@ bool adjust_candidate_ranking(const std::string &main_db_path, const std::string
     // tiny `upper` (weight=1 rare words) as the staircase base and wrote
     // negative weights onto neighboring keys from query_series().
     std::int64_t new_weight = 0;
+    const std::int64_t top_eff = effective_weight(database_candidates[0]);
     const bool top_near_limit =
-        target == 0 && database_candidates[0].weight > (std::numeric_limits<std::int64_t>::max)() - 1000;
-    const std::int64_t upper = target == 0 && !top_near_limit ? database_candidates[0].weight + 1000
-                                                              : (target == 0 ? database_candidates[0].weight
-                                                                             : database_candidates[target - 1].weight);
-    const std::int64_t lower = database_candidates[target].weight;
+        target == 0 && top_eff > (std::numeric_limits<std::int64_t>::max)() - 1000;
+    const std::int64_t upper = target == 0 && !top_near_limit ? top_eff + 1000
+                                                              : (target == 0 ? top_eff
+                                                                             : effective_weight(database_candidates[target - 1]));
+    const std::int64_t lower = effective_weight(database_candidates[target]);
     const bool oversized = upper > kManagedWeightCeiling || lower > kManagedWeightCeiling;
     bool need_rebalance =
         top_near_limit || lower == (std::numeric_limits<std::int64_t>::max)() || upper <= lower || oversized;
@@ -1594,26 +1608,28 @@ bool adjust_candidate_ranking(const std::string &main_db_path, const std::string
             // candidate and skip a short run of occupied weights. This may
             // advance one extra position, but keeps ordering deterministic
             // without paying for a rebalance in the common case.
-            new_weight = upper + 1;
+            std::int64_t new_eff = upper + 1;
             size_t conflicts = 0;
             for (size_t i = target; i-- > 0;)
             {
-                const std::int64_t occupied = database_candidates[i].weight;
-                if (occupied < new_weight)
+                const std::int64_t occupied = effective_weight(database_candidates[i]);
+                if (occupied < new_eff)
                     continue;
-                if (occupied > new_weight)
+                if (occupied > new_eff)
                     break;
-                if (++conflicts >= 16 || new_weight >= kManagedWeightCeiling)
+                if (++conflicts >= 16 || new_eff >= kManagedWeightCeiling)
                 {
                     need_rebalance = true;
                     break;
                 }
-                ++new_weight;
+                ++new_eff;
             }
+            new_weight = to_raw_weight(new_eff, selected->fuzzy);
         }
         else
         {
-            new_weight = lower + (upper - lower) / 2;
+            const std::int64_t new_eff = lower + (upper - lower) / 2;
+            new_weight = to_raw_weight(new_eff, selected->fuzzy);
         }
     }
     if (need_rebalance && !oversized && !top_near_limit && target != 0)
@@ -1634,7 +1650,7 @@ bool adjust_candidate_ranking(const std::string &main_db_path, const std::string
             }
             else
             {
-                new_weight = clamp_managed_weight(cluster + kRebalanceGap);
+                new_weight = clamp_managed_weight(to_raw_weight(cluster + kRebalanceGap, selected->fuzzy));
                 need_rebalance = false;
             }
         }
@@ -1655,7 +1671,8 @@ bool adjust_candidate_ranking(const std::string &main_db_path, const std::string
         {
             if (!owns_entry_key[i])
                 continue;
-            const std::int64_t weight = clamp_managed_weight(base - static_cast<std::int64_t>(i) * kRebalanceGap);
+            const std::int64_t eff = base - static_cast<std::int64_t>(i) * kRebalanceGap;
+            const std::int64_t weight = clamp_managed_weight(to_raw_weight(eff, database_candidates[i].fuzzy));
             rebalance_ok = update_ranked_weight(main_db.get(), journal_upsert.get(), kind, entry_key,
                                                 database_candidates[i].word, weight);
         }
@@ -1665,8 +1682,9 @@ bool adjust_candidate_ranking(const std::string &main_db_path, const std::string
             rollback_user();
             return false;
         }
-        new_weight = target == 0 ? base + kRebalanceGap
-                                 : base - static_cast<std::int64_t>(target) * kRebalanceGap + kRebalanceGap / 2;
+        const std::int64_t new_eff = target == 0 ? base + kRebalanceGap
+                                                 : base - static_cast<std::int64_t>(target) * kRebalanceGap + kRebalanceGap / 2;
+        new_weight = to_raw_weight(new_eff, selected->fuzzy);
     }
     new_weight = clamp_managed_weight(new_weight);
     const bool ok = update_ranked_weight(main_db.get(), journal_upsert.get(), kind, entry_key, value, new_weight);
