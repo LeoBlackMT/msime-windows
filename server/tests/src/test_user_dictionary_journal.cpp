@@ -661,6 +661,14 @@ TEST_CASE(UserDictionaryPromoteFuzzyCandidateNormalizesWeight)
         const std::int64_t new_w = db.scalar_int64("SELECT weight FROM tbl_2_z WHERE value='执行'");
         REQUIRE(new_w > 500000);
         REQUIRE(static_cast<double>(new_w) * 0.2 > 100000.0);
+
+        ranking_changed = false;
+        zhixing.weight = new_w;
+        std::vector<WordItem> promoted_candidates = {zhixing, zhixin};
+        REQUIRE(user_dictionary::adjust_candidate_ranking(test::Utf8(main_path), test::Utf8(user_path), "zhi'xin",
+                                                          promoted_candidates, "zhi'xing", "执行", "pin", 1, 1, true,
+                                                          &ranking_changed));
+        REQUIRE(!ranking_changed);
     }
     std::filesystem::remove_all(directory);
 }

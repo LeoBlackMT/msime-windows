@@ -1564,7 +1564,7 @@ bool adjust_candidate_ranking(const std::string &main_db_path, const std::string
         return false;
     }
     const size_t rank = static_cast<size_t>(selected - database_candidates.begin());
-    if (rank == 0 && !ordered_candidates.empty() && ordered_candidates.front().word == value)
+    if (rank == 0)
     {
         auto reset = prepare(
             user_db.get(), "DELETE FROM candidate_selection_state WHERE context_key=?1 AND entry_key=?2 AND value=?3");
